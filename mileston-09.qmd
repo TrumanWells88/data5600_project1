@@ -1,0 +1,276 @@
+---
+title: "Milestone 09"
+---
+
+### Setup and Cleaning
+
+```{python}
+import numpy as np
+import polars as pl
+import statsmodels.formula.api as smf
+from plotnine import *
+from pyprojroot.here import here
+
+team_data = pl.read_csv(here('data/evanmiya_team_ratings_2026_27.csv'))
+nil_data = pl.read_csv(here('data/sideline-basketball-nil-rankings.csv'), skip_rows = 3)
+player_data = pl.read_csv(here('data/evanmiya_bpr_2026_27.csv'), null_values = 'NA')
+```
+
+```{python}
+# Standardize Sideline school names to match EvanMiya
+school_names = {
+  'American University': 'American', 'Detroit Mercy': 'Detroit', 'FIU': 'Florida International',
+  'Grambling State': 'Grambling', 'IU Indianapolis': 'IU Indy', 'LIU': 'Long Island',
+  'Louisiana': 'Louisiana-Lafayette', 'Louisiana Monroe': 'Louisiana-Monroe',
+  'Loyola (Maryland)': 'Loyola Maryland', 'Maryland Eastern Shore': 'Maryland-Eastern Shore',
+  'McNeese': 'McNeese State', 'Miami (FL)': 'Miami (Fla.)', 'NC A&T': 'North Carolina A&T',
+  'NC Central': 'North Carolina Central', 'Nicholls': 'Nicholls State', 'Prairie View A&M': 'Prairie View',
+  'Purdue Fort Wayne': 'Fort Wayne', 'Queens University': 'Queens', 'SE Missouri State': 'Southeast Missouri State',
+  'SIUE': 'SIU Edwardsville', 'Sam Houston': 'Sam Houston State', 'Seattle University': 'Seattle',
+  'Southern Miss': 'Southern Mississippi', 'St. Thomas': 'St. Thomas (MN)', 'UConn': 'Connecticut',
+  'UIC': 'Illinois-Chicago', 'USC Upstate': 'South Carolina Upstate', 'UT Martin': 'Tennessee-Martin',
+  'UTRGV': 'Texas-Rio Grande Valley'
+}
+tier_names = {'Power 4': 'Power4', 'Lower-Tier': 'LowerTier'}
+
+nil_clean = (nil_data
+  .select(
+    pl.col('School').alias('team'),
+    pl.col('Tier').alias('tier'),
+    pl.col("Men's Basketball NIL Estimate ($M)").alias('nil_m')
+  )
+  .with_columns([
+    pl.col('team').replace(school_names).alias('team'),
+    pl.col('tier').replace(tier_names).alias('tier')
+  ])
+  .unique()
+)
+
+# Keep only the useful EvanMiya columns
+team_clean = (team_data
+  .select('team', 'rank', 'obpr', 'dbpr', 'bpr', 'tempo')
+  .unique()
+)
+
+# Join teams with a NIL estimate and log-transform NIL
+tm_data = (team_clean
+  .join(nil_clean, on = 'team', how = 'inner')
+  .with_columns(pl.col('nil_m').log().alias('log_nil'))
+)
+```
+
+```{python}
+from sklearn.model_selection import train_test_split
+
+# Conference is in the Sideline file, so bring it into the team data
+conf_lookup = (nil_data
+  .select(pl.col('School').alias('team'), pl.col('Conference').alias('conference'))
+  .with_columns([
+    pl.col('team').replace(school_names).alias('team'),
+    pl.col('conference').str.replace_all('[^A-Za-z0-9]', '').alias('conference')
+  ])
+  .unique()
+)
+
+tm_data = tm_data.join(conf_lookup, on = 'team', how = 'left')
+```
+
+## Setup
+
+```{python}
+import arviz as az
+import bambi as bmb
+
+# Show all rows and columns of the tables
+pl.Config.set_tbl_rows(40)
+pl.Config.set_tbl_cols(-1)
+
+# Recreate the training data (split, transform, dummy code)
+tm_data = tm_data.sort('team')
+
+X = tm_data.select('bpr', 'conference')
+y = tm_data.select('nil_m')
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state = 42)
+
+y_train = (y_train
+  .with_columns(log_nil = pl.col('nil_m').log())
+  .select('log_nil')
+)
+
+X_train = (X_train
+  .to_dummies(columns = ['conference'], drop_first = False)
+  .select(pl.exclude('conference_BigTen'))
+)
+
+# Combine y_train and X_train
+nil_train = pl.concat([y_train, X_train], how = 'horizontal_extend').to_pandas()
+
+predictors = [c for c in nil_train.columns if c != 'log_nil']
+```
+
+## Frequentist model confidence intervals and significance
+
+```{python}
+# Fit a frequentist linear regression
+fr_fit = smf.ols('log_nil ~ ' + ' + '.join(predictors), data = nil_train).fit()
+
+# Confidence intervals and p-values, back-transformed to percent change in NIL
+fr_ci = fr_fit.conf_int()
+
+fr_table = (pl.DataFrame({
+  'term': list(fr_ci.index),
+  'estimate': fr_fit.params.values,
+  'lower': fr_ci[0].values,
+  'upper': fr_ci[1].values,
+  'p_value': fr_fit.pvalues.values
+})
+  .filter(pl.col('term') != 'Intercept')
+  .with_columns(
+    pct_estimate = (pl.col('estimate').exp() - 1) * 100,
+    pct_lower = (pl.col('lower').exp() - 1) * 100,
+    pct_upper = (pl.col('upper').exp() - 1) * 100,
+    significant = (pl.col('lower') > 0) | (pl.col('upper') < 0)
+  )
+  .sort('pct_estimate', descending = True)
+  .with_columns(pl.col(pl.Float64).round(3))
+)
+
+fr_table
+```
+
+## Bayesian Model with priors
+
+```{python}
+# Specify a Bayesian linear regression with uniform priors
+ba_model = bmb.Model('log_nil ~ ' + ' + '.join(predictors), data = nil_train)
+
+priors_dict = {
+  'Intercept': bmb.Prior('Uniform', lower = -100, upper = 100),
+  **{term: bmb.Prior('Uniform', lower = -100, upper = 100) for term in predictors},
+  'sigma': bmb.Prior('Exponential', lam = 1)
+}
+
+ba_model.set_priors(priors = priors_dict)
+
+# Fit the model
+ba_fit = ba_model.fit(draws = 2000, tune = 2000, chains = 4, random_seed = 42)
+```
+
+### Post summary with credible intervals
+
+```{python}
+ba_summary = az.summary(ba_fit, ci_kind = 'hdi', ci_prob = 0.95, round_to = 4)
+ba_summary
+```
+
+With many dummy variables the default settings gave low effective sample sizes and a r-hat warning, so we raised the draws a bunch and tuning steps. In the summary, every r_hat is at most 1.004, the smallest ess_bulk is about 480, and there were no divergences. That means the chains converged.
+
+## Credible vs Confidence intervals 
+
+```{python}
+comparison = (pl.DataFrame({
+  'term': list(fr_ci.index),
+  'conf_lower': fr_ci[0].values,
+  'conf_upper': fr_ci[1].values,
+  'cred_lower': ba_summary.loc[fr_ci.index, 'hdi95_lb'].values,
+  'cred_upper': ba_summary.loc[fr_ci.index, 'hdi95_ub'].values
+})
+  .with_columns(
+    conf_significant = (pl.col('conf_lower') > 0) | (pl.col('conf_upper') < 0),
+    cred_significant = (pl.col('cred_lower') > 0) | (pl.col('cred_upper') < 0),
+    conf_width = pl.col('conf_upper') - pl.col('conf_lower'),
+    cred_width = pl.col('cred_upper') - pl.col('cred_lower'),
+    gap_lower = (pl.col('conf_lower') - pl.col('cred_lower')).abs(),
+    gap_upper = (pl.col('conf_upper') - pl.col('cred_upper')).abs()
+  )
+  .with_columns(pl.col(pl.Float64).round(3))
+)
+
+comparison.select('term', 'conf_lower', 'conf_upper', 'cred_lower', 'cred_upper', 'conf_significant', 'cred_significant')
+
+```
+
+```{python}
+(comparison
+  .select(
+    same_significance = (pl.col('conf_significant') == pl.col('cred_significant')).all(),
+    max_gap_lower = pl.col('gap_lower').max(),
+    max_gap_upper = pl.col('gap_upper').max(),
+    mean_width_ratio = (pl.col('cred_width') / pl.col('conf_width')).mean()
+  )
+)
+```
+
+## Interpretations
+
+- BPR: THe slope for the confidence interval is 0.018, 0.039 on the log scale, with p < 0.001
+
+-- Confidence Interval: Holding all other variables fixed, Based on the OLS interval estimate, 95% of such intervals will contain the true value, so we are 95% confident that one more BPR point increases team NIL by between 1.8% and 3.9% (point estimate 2.9%), holding conference fixed.
+
+-- Credible Interval: Holding all other variables fixed, The 95% credible interval is (0.0185, 0.0386). With probability 0.95, one more BPR point increases team NIL by between 1.9% and 3.9%
+
+-- Significance: The interval does not include 0, so BPR is statitically significant
+
+- Intercept
+
+Holding all other variables fixed, A Big Ten team with a BPR of 0 has an expected NIL of $4.13M (95% CI $3.12M to $5.47M). This is a baseline only, since no Big Ten team has a BPR near 0.
+
+- Conferences
+Holding all other variables fixed, 27 of the 32 slope estimates are statistically significant, BPR and 26 conferences among them.
+
+- Credible vs Confidence
+The two intervals are almost exactly the same. The largest endpoint gap on the log scale is 0.035, the Bayesian model intervals are on avg 99% as wide as the OLS ones. And they both agree on significance for all 33 of the terms. The remaining difference comes from sampling noise and from HDI vs the OLS interval. Interpretation is different though. The credible interval is a direct probability statement about the parameter, given the data and model. The confidence interval describes how often the procedure would capture the true value across repeated samples.
+
+## Log NIL from BPR and conference
+
+```{python}
+conf_lookup = (nil_data
+  .select(pl.col('School').alias('team'), pl.col('Conference').alias('conference'))
+  .with_columns([
+    pl.col('team').replace(school_names).alias('team'),
+    pl.col('conference').str.replace_all('[^A-Za-z0-9]', '').alias('conference')
+  ])
+  .unique()
+)
+
+tm_train = (tm_data
+  .join(conf_lookup, on = 'team', how = 'left')
+  .to_dummies(columns = ['conference'], drop_first = False)
+  .select(pl.exclude('conference_BigTen'))
+)
+
+conf_cols = [c for c in tm_train.columns if c.startswith('conference_')]
+
+fit_01 = smf.ols('log_nil ~ bpr + ' + ' + '.join(conf_cols), data = tm_train).fit()
+
+tm_train = (tm_train
+  .with_columns(dffits = fit_01.get_influence().dffits[0])
+  .with_columns(abs_dffits = pl.col('dffits').abs())
+  .with_row_index('observation')
+)
+
+n, p = len(tm_train), len(fit_01.params)
+dffits_cutoff = 1 if n <= 30 else 2 * np.sqrt(p / n)
+
+(ggplot(tm_train, aes(x = 'observation', y = 'abs_dffits'))
+  + geom_point(alpha = 0.25)
+  + geom_hline(yintercept = dffits_cutoff, color = 'red')
+  + labs(
+    title = 'Representativeness: DFFITS',
+    subtitle = 'Potentially influential above red line',
+    x = 'Observation',
+    y = 'Absolute Value of DFFITS'
+  )
+  + theme_minimal()
+)
+```
+
+```{python}
+(tm_train
+  .filter(pl.col('abs_dffits') > dffits_cutoff)
+  .sort('dffits', descending = True)
+  .select('team', 'tier', 'bpr', 'nil_m', 'dffits')
+)
+```
+

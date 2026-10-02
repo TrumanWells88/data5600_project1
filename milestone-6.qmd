@@ -1,0 +1,231 @@
+---
+title: "Mileston 06"
+---
+
+## Load data and libraires
+
+```{python}
+import numpy as np
+import polars as pl
+import statsmodels.formula.api as smf
+from plotnine import *
+from pyprojroot.here import here
+
+team_data = pl.read_csv(here('data/evanmiya_team_ratings_2026_27.csv'))
+nil_data = pl.read_csv(here('data/sideline-basketball-nil-rankings.csv'), skip_rows = 3)
+player_data = pl.read_csv(here('data/evanmiya_bpr_2026_27.csv'), null_values = 'NA')
+```
+
+## Clean our data
+
+- Empty columns like season, opponent_adjust, home_rank, the kill shots columns, wins and losses are constant since the seasons hasnt started
+- Duplicate rank since preseason rank and rank are the same
+- Rank is also pretty much identical to bpr so it cant be a predictor
+- Obpr and dbpr are literally the sum of Bpr
+- 29 schools are spelled differently in the two sources so we need to fix that
+- The NIL data is right skewed so we need to log it
+
+### Team name cleaning
+
+```{python}
+# Standardize Sideline school names to match EvanMiya
+school_names = {
+  'American University': 'American', 'Detroit Mercy': 'Detroit', 'FIU': 'Florida International',
+  'Grambling State': 'Grambling', 'IU Indianapolis': 'IU Indy', 'LIU': 'Long Island',
+  'Louisiana': 'Louisiana-Lafayette', 'Louisiana Monroe': 'Louisiana-Monroe',
+  'Loyola (Maryland)': 'Loyola Maryland', 'Maryland Eastern Shore': 'Maryland-Eastern Shore',
+  'McNeese': 'McNeese State', 'Miami (FL)': 'Miami (Fla.)', 'NC A&T': 'North Carolina A&T',
+  'NC Central': 'North Carolina Central', 'Nicholls': 'Nicholls State', 'Prairie View A&M': 'Prairie View',
+  'Purdue Fort Wayne': 'Fort Wayne', 'Queens University': 'Queens', 'SE Missouri State': 'Southeast Missouri State',
+  'SIUE': 'SIU Edwardsville', 'Sam Houston': 'Sam Houston State', 'Seattle University': 'Seattle',
+  'Southern Miss': 'Southern Mississippi', 'St. Thomas': 'St. Thomas (MN)', 'UConn': 'Connecticut',
+  'UIC': 'Illinois-Chicago', 'USC Upstate': 'South Carolina Upstate', 'UT Martin': 'Tennessee-Martin',
+  'UTRGV': 'Texas-Rio Grande Valley'
+}
+tier_names = {'Power 4': 'Power4', 'Lower-Tier': 'LowerTier'}
+
+nil_clean = (nil_data
+  .select(
+    pl.col('School').alias('team'),
+    pl.col('Tier').alias('tier'),
+    pl.col("Men's Basketball NIL Estimate ($M)").alias('nil_m')
+  )
+  .with_columns([
+    pl.col('team').replace(school_names).alias('team'),
+    pl.col('tier').replace(tier_names).alias('tier')
+  ])
+  .unique()
+)
+
+# Keep only the useful EvanMiya columns
+team_clean = (team_data
+  .select('team', 'rank', 'obpr', 'dbpr', 'bpr', 'tempo')
+  .unique()
+)
+
+# Join teams with a NIL estimate and log-transform NIL
+tm_data = (team_clean
+  .join(nil_clean, on = 'team', how = 'inner')
+  .with_columns(pl.col('nil_m').log().alias('log_nil'))
+)
+```
+
+```{python}
+print(f'EvanMiya teams: {team_clean.height}, Sideline schools: {nil_clean.height}, matched: {tm_data.height}')
+```
+
+
+## Viz 1: Team NIL and BPR
+
+```{python}
+(ggplot(tm_data, aes(x = 'log_nil', y = 'bpr'))
+  + geom_point(aes(color = 'tier'), alpha = 0.6)
+  + geom_smooth(method = 'lm', color = 'black', se = False)
+  + labs(title = 'Team NIL and Team BPR', x = 'log(Team NIL in $M)', y = 'Team BPR', color = 'Tier')
+)
+```
+
+```{python}
+(tm_data
+  .group_by('tier')
+  .agg(
+    n = pl.len(),
+    avg_nil = pl.col('nil_m').mean(),
+    avg_bpr = pl.col('bpr').mean(),
+    cor = pl.corr('log_nil', 'bpr')
+  )
+  .sort('avg_nil', descending = True)
+)
+```
+
+So, BPR goes up with log NIL (r=0.81) The relationship is also pretty good in the Tiers. The correlation is 0.62 in Power 4 (68 teams), 0.79 in the basketball-first tier, 0.56 in G5 and 0.55 in the lower tier. It is weak only in FCS (0.12), where budgets cluster between about $0.3M and $2M.
+
+## Viz 2: team BPR by tier
+
+```{python}
+(ggplot(tm_data, aes(x = 'bpr', fill = 'tier'))
+  + geom_density(alpha = 0.4)
+  + labs(title = 'Team BPR by Tier', x = 'Team BPR', y = 'Density', fill = 'Tier')
+)
+```
+
+Power 4 is pretty much alone at the top with the range of 4.3 to 31.3 and the other tiers overlap with eachother a bunch
+
+## Validity
+
+Team BPR: it measures strength, but it is a preseason projection built from rosters. Wins and losses are all zero, so it is not realized results.
+Team NIL: it is Sideline's estimate, not audited spending.
+Independence: the two are built by different providers, so an association between them is informative.
+
+### How do those outcomes compare?
+```{python}
+# Set randomization seed
+rng = np.random.default_rng(42)
+
+# Specify a function to simulate data
+def sim_data(n, beta_0, beta_nil, beta_power4, sigma):
+  log_nil = rng.normal(0.2, 1.2, size = n)
+  power4 = rng.binomial(1, 0.2, size = n)
+  error = rng.normal(0, sigma, size = n)
+  bpr = beta_0 + beta_nil * log_nil + beta_power4 * power4 + error
+
+  # Return the output as a DataFrame
+  return pl.DataFrame({'bpr': bpr, 'log_nil': log_nil, 'power4': power4})
+
+# Call the sim_data function
+sm_data = sim_data(n = 353, beta_0 = -3, beta_nil = 5, beta_power4 = 5, sigma = 6)
+
+# Compare the simulated and real outcomes
+(ggplot()
+  + geom_density(sm_data, aes(x = 'bpr'), color = 'red')
+  + geom_density(tm_data, aes(x = 'bpr'))
+  + labs(
+    title = 'Validity: Simulated vs. Real Outcomes',
+    subtitle = 'Investigate structural differences',
+    x = 'outcome'
+  )
+)
+```
+
+I would say validity is met as long as we know BPR is projected since the season hasnt started yet. NIL is a also a modeled estimate that is compressed at the top
+
+## Representativeness
+
+```{python}
+dropped = team_clean.join(nil_clean, on = 'team', how = 'anti')
+
+dropped.select('team', 'rank', 'bpr').sort('rank')
+```
+
+```{python}
+pl.DataFrame({
+  'group': ['kept', 'dropped'],
+  'n': [tm_data.height, dropped.height],
+  'avg_bpr': [tm_data['bpr'].mean(), dropped['bpr'].mean()]
+})
+```
+
+So Twelve EvanMiya teams have no Sideline estimate: Air Force, Army, Navy, College of Charleston, Northern Kentucky, Arkansas-Little Rock, Missouri-Kansas City, Le Moyne, Mercyhurst, New Haven, West Florida and West Georgia. They are not missing at random. Their average BPR is −8.5 versus 0.29 for the kept teams, and only College of Charleston ranks above 200. We under-cover the weakest programs slightly.
+
+```{python}
+pl_data = (player_data
+  .select('name', 'team', 'class_year', 'bpr', 'in_portal')
+  .remove(pl.col('in_portal'))
+  .join(nil_clean, on = 'team', how = 'inner')
+)
+
+print(f'Players: {player_data.height} -> {player_data.filter(~pl.col("in_portal")).height} without portal players -> {pl_data.height} on teams with a budget')
+```
+
+We have 5208 players, I dropped the 69 players that are currently in the portal right now
+
+## Dummy Code 
+
+```{python}
+# Dummy code discrete predictors
+tm_train = (tm_data
+  .to_dummies(columns = ['tier'], drop_first = False)
+  .select(pl.exclude('tier_Power4'))
+)
+
+# Fit a model
+fit_01 = smf.ols(
+  'bpr ~ log_nil + tier_Basketball + tier_G5 + tier_LowerTier + tier_FCS + tier_Ivy',
+  data = tm_train
+).fit()
+
+# Save the dffits values
+tm_train = (tm_train
+  .with_columns(dffits = fit_01.get_influence().dffits[0])
+  .with_columns(abs_dffits = pl.col('dffits').abs())
+  .with_row_index('observation')
+)
+
+n, p = len(tm_train), len(fit_01.params)
+dffits_cutoff = 1 if n <= 30 else 2 * np.sqrt(p / n)
+
+(ggplot(tm_train, aes(x = 'observation', y = 'abs_dffits'))
+  + geom_point(alpha = 0.25)
+  + geom_hline(yintercept = dffits_cutoff, color = 'red')
+  + labs(
+    title = 'Representativeness: DFFITS',
+    subtitle = 'Potentially influential above red line',
+    x = 'Observation',
+    y = 'Absolute Value of DFFITS'
+  )
+  + theme_minimal()
+)
+```
+
+```{python}
+(tm_train
+  .filter(pl.col('abs_dffits') > dffits_cutoff)
+  .sort('dffits', descending = True)
+  .select('team', 'nil_m', 'bpr', 'dffits')
+  .slice(0, 8)
+)
+```
+
+
+I would say we our data is representative. It slightly under-covers the weakest programs, and the conclusions apply to teams, not individual players.
+
