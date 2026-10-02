@@ -1,5 +1,14 @@
 ---
-title: "Milestone 07 and 08
+title: "My Report"
+author: "Truman Wells, Spencer McEntire, Carly Veile"
+date: today
+format:
+  pdf:
+    toc: true            
+    number-sections: true
+    geometry: margin=1in 
+    fontsize: 11pt
+    echo: false
 ---
 
 ## Setup and Cleaning for milestone 06

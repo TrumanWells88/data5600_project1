@@ -1,5 +1,14 @@
 ---
-title: "Milestone 09"
+title: "My Report"
+author: "Truman Wells, Spencer McEntire, Carly Veile"
+date: today
+format:
+  pdf:
+    toc: true            
+    number-sections: true
+    geometry: margin=1in 
+    fontsize: 11pt
+    echo: false
 ---
 
 ### Setup and Cleaning
@@ -10,6 +19,10 @@ import polars as pl
 import statsmodels.formula.api as smf
 from plotnine import *
 from pyprojroot.here import here
+import pytensor
+pytensor.config.cxx = ""
+
+import pymc as pm
 
 team_data = pl.read_csv(here('data/evanmiya_team_ratings_2026_27.csv'))
 nil_data = pl.read_csv(here('data/sideline-basketball-nil-rankings.csv'), skip_rows = 3)
@@ -225,17 +238,7 @@ The two intervals are almost exactly the same. The largest endpoint gap on the l
 ## Log NIL from BPR and conference
 
 ```{python}
-conf_lookup = (nil_data
-  .select(pl.col('School').alias('team'), pl.col('Conference').alias('conference'))
-  .with_columns([
-    pl.col('team').replace(school_names).alias('team'),
-    pl.col('conference').str.replace_all('[^A-Za-z0-9]', '').alias('conference')
-  ])
-  .unique()
-)
-
 tm_train = (tm_data
-  .join(conf_lookup, on = 'team', how = 'left')
   .to_dummies(columns = ['conference'], drop_first = False)
   .select(pl.exclude('conference_BigTen'))
 )
