@@ -1,0 +1,346 @@
+---
+title: "Milestone 10"
+---
+
+## Setup and Recreate the Train and test data
+```{python}
+import numpy as np
+import polars as pl
+import statsmodels.formula.api as smf
+from plotnine import *
+from pyprojroot.here import here
+
+team_data = pl.read_csv(here('data/evanmiya_team_ratings_2026_27.csv'))
+nil_data = pl.read_csv(here('data/sideline-basketball-nil-rankings.csv'), skip_rows = 3)
+player_data = pl.read_csv(here('data/evanmiya_bpr_2026_27.csv'), null_values = 'NA')
+```
+
+```{python}
+# Standardize Sideline school names to match EvanMiya
+school_names = {
+  'American University': 'American', 'Detroit Mercy': 'Detroit', 'FIU': 'Florida International',
+  'Grambling State': 'Grambling', 'IU Indianapolis': 'IU Indy', 'LIU': 'Long Island',
+  'Louisiana': 'Louisiana-Lafayette', 'Louisiana Monroe': 'Louisiana-Monroe',
+  'Loyola (Maryland)': 'Loyola Maryland', 'Maryland Eastern Shore': 'Maryland-Eastern Shore',
+  'McNeese': 'McNeese State', 'Miami (FL)': 'Miami (Fla.)', 'NC A&T': 'North Carolina A&T',
+  'NC Central': 'North Carolina Central', 'Nicholls': 'Nicholls State', 'Prairie View A&M': 'Prairie View',
+  'Purdue Fort Wayne': 'Fort Wayne', 'Queens University': 'Queens', 'SE Missouri State': 'Southeast Missouri State',
+  'SIUE': 'SIU Edwardsville', 'Sam Houston': 'Sam Houston State', 'Seattle University': 'Seattle',
+  'Southern Miss': 'Southern Mississippi', 'St. Thomas': 'St. Thomas (MN)', 'UConn': 'Connecticut',
+  'UIC': 'Illinois-Chicago', 'USC Upstate': 'South Carolina Upstate', 'UT Martin': 'Tennessee-Martin',
+  'UTRGV': 'Texas-Rio Grande Valley'
+}
+tier_names = {'Power 4': 'Power4', 'Lower-Tier': 'LowerTier'}
+
+nil_clean = (nil_data
+  .select(
+    pl.col('School').alias('team'),
+    pl.col('Tier').alias('tier'),
+    pl.col("Men's Basketball NIL Estimate ($M)").alias('nil_m')
+  )
+  .with_columns([
+    pl.col('team').replace(school_names).alias('team'),
+    pl.col('tier').replace(tier_names).alias('tier')
+  ])
+  .unique()
+)
+
+# Keep only the useful EvanMiya columns
+team_clean = (team_data
+  .select('team', 'rank', 'obpr', 'dbpr', 'bpr', 'tempo')
+  .unique()
+)
+
+# Join teams with a NIL estimate and log-transform NIL
+tm_data = (team_clean
+  .join(nil_clean, on = 'team', how = 'inner')
+  .with_columns(pl.col('nil_m').log().alias('log_nil'))
+)
+```
+
+```{python}
+from sklearn.model_selection import train_test_split
+
+# Conference is in the Sideline file, so bring it into the team data
+conf_lookup = (nil_data
+  .select(pl.col('School').alias('team'), pl.col('Conference').alias('conference'))
+  .with_columns([
+    pl.col('team').replace(school_names).alias('team'),
+    pl.col('conference').str.replace_all('[^A-Za-z0-9]', '').alias('conference')
+  ])
+  .unique()
+)
+
+tm_data = tm_data.join(conf_lookup, on = 'team', how = 'left')
+```
+
+## Setup
+
+```{python}
+import arviz as az
+import bambi as bmb
+
+# Show all rows and columns of the tables
+pl.Config.set_tbl_rows(40)
+pl.Config.set_tbl_cols(-1)
+
+# Recreate the training data (split, transform, dummy code)
+tm_data = tm_data.sort('team')
+
+X = tm_data.select('bpr', 'conference')
+y = tm_data.select('nil_m')
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state = 42)
+
+y_train = (y_train
+  .with_columns(log_nil = pl.col('nil_m').log())
+  .select('log_nil')
+)
+
+X_train = (X_train
+  .to_dummies(columns = ['conference'], drop_first = False)
+  .select(pl.exclude('conference_BigTen'))
+)
+
+# Combine y_train and X_train
+nil_train = pl.concat([y_train, X_train], how = 'horizontal_extend').to_pandas()
+
+predictors = [c for c in nil_train.columns if c != 'log_nil']
+```
+
+```{python}
+import statsmodels.api as sm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import root_mean_squared_error
+import pandas as pd
+import numpy as np
+import polars as pl
+
+# Sort so the split stays reproducible
+tm_data = tm_data.sort('team')
+
+# Use BPR and conference as possible predictors
+X = tm_data.select('bpr', 'conference')
+y = tm_data.select('nil_m')
+
+# Same 80/20 split as Milestone 08
+X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
+    X,
+    y,
+    test_size = 0.2,
+    random_state = 42
+)
+
+# Log-transform NIL
+y_train = np.log(y_train_raw['nil_m'].to_numpy())
+y_test = np.log(y_test_raw['nil_m'].to_numpy())
+```
+
+## Model 1: BPR Only
+
+```{python}
+# Model 1: BPR only
+X_train_simple = X_train_raw.select('bpr').to_pandas()
+X_test_simple = X_test_raw.select('bpr').to_pandas()
+
+X_train_simple = sm.add_constant(X_train_simple)
+X_test_simple = sm.add_constant(X_test_simple)
+
+fit_simple = sm.OLS(y_train, X_train_simple).fit()
+
+simple_pred = fit_simple.predict(X_test_simple)
+
+simple_rmse = root_mean_squared_error(y_test, simple_pred)
+```
+
+## Model 2: BPR and conference
+
+```{python}
+# Convert raw predictors to pandas
+train_full = X_train_raw.to_pandas()
+test_full = X_test_raw.to_pandas()
+
+# Dummy code conference
+train_full = pd.get_dummies(
+    train_full,
+    columns = ['conference'],
+    drop_first = False,
+    dtype = int
+)
+
+test_full = pd.get_dummies(
+    test_full,
+    columns = ['conference'],
+    drop_first = False,
+    dtype = int
+)
+
+# Big Ten is the reference group
+train_full = train_full.drop(
+    columns = ['conference_BigTen'],
+    errors = 'ignore'
+)
+
+test_full = test_full.drop(
+    columns = ['conference_BigTen'],
+    errors = 'ignore'
+)
+
+# Make sure the test set has exactly the same columns as training
+test_full = test_full.reindex(
+    columns = train_full.columns,
+    fill_value = 0
+)
+
+X_train_full = sm.add_constant(train_full)
+X_test_full = sm.add_constant(test_full, has_constant = 'add')
+
+# Fit model
+fit_full = sm.OLS(y_train, X_train_full).fit()
+
+# Predict held-out teams
+full_pred = fit_full.predict(X_test_full)
+
+full_rmse = root_mean_squared_error(y_test, full_pred)
+```
+
+## Compare the model fit
+
+```{python}
+model_comparison = pl.DataFrame({
+    'model': ['BPR only', 'BPR + conference'],
+    'r_squared': [
+        fit_simple.rsquared,
+        fit_full.rsquared
+    ],
+    'adjusted_r_squared': [
+        fit_simple.rsquared_adj,
+        fit_full.rsquared_adj
+    ],
+    'test_rmse': [
+        simple_rmse,
+        full_rmse
+    ]
+})
+
+model_comparison
+```
+
+
+## Decision
+
+Our model isnt really trying to minimize error on an absrtact log scale. What we are trying to do is estimate what a team's NIL level looks like given its value of players on their team, so we can compare expected NIL to actual NIL for teams
+
+```{python}
+# Back-transform test predictions into $ millions
+simple_nil_pred = np.exp(simple_pred)
+full_nil_pred = np.exp(full_pred)
+
+actual_nil = y_test_raw['nil_m'].to_numpy()
+
+# Business-oriented loss:
+# squared error in estimated team NIL ($M)
+simple_loss = np.mean((actual_nil - simple_nil_pred) ** 2)
+full_loss = np.mean((actual_nil - full_nil_pred) ** 2)
+
+decision_comparison = pl.DataFrame({
+    'model': ['BPR only', 'BPR + conference'],
+    'mean_squared_NIL_loss': [
+        simple_loss,
+        full_loss
+    ]
+})
+
+decision_comparison
+```
+
+We were unsure whether conference needed to remain in the model because including it adds 31 parameters and substantially increases model complexity. We compared a BPR-only model with a model containing BPR and conference. We evaluated both in-sample fit, predictive RMSE on the held-out test data, and decision-theoretic loss measured as squared error in predicted NIL value.
+
+## Refit the winning model
+
+```{python}
+# Full dataset
+final_data = tm_data.select(
+    'team',
+    'bpr',
+    'conference',
+    'nil_m'
+).to_pandas()
+
+# Dummy code conference
+X_final = pd.get_dummies(
+    final_data[['bpr', 'conference']],
+    columns = ['conference'],
+    drop_first = False,
+    dtype = int
+)
+
+# Big Ten reference
+X_final = X_final.drop(
+    columns = ['conference_BigTen'],
+    errors = 'ignore'
+)
+
+X_final = sm.add_constant(X_final)
+
+y_final = np.log(final_data['nil_m'])
+
+# Refit selected model on ALL data
+final_fit = sm.OLS(y_final, X_final).fit()
+
+final_fit.summary()
+```
+
+## Prediction
+
+```{python}
+# Predicted log NIL
+final_data['predicted_log_nil'] = final_fit.predict(X_final)
+
+# Convert to $ millions
+final_data['predicted_nil'] = np.exp(
+    final_data['predicted_log_nil']
+)
+
+# Difference between model-implied NIL and actual NIL
+final_data['value_gap'] = (
+    final_data['predicted_nil']
+    - final_data['nil_m']
+)
+
+# Ratio is also useful
+final_data['value_ratio'] = (
+    final_data['predicted_nil']
+    / final_data['nil_m']
+)
+
+value_results = (
+    pl.from_pandas(final_data)
+    .select(
+        'team',
+        'conference',
+        'bpr',
+        'nil_m',
+        'predicted_nil',
+        'value_gap',
+        'value_ratio'
+    )
+    .sort('value_gap', descending = True)
+)
+
+value_results
+```
+
+
+### Teams that are doing the most with less
+
+```{python}
+value_results.head(10)
+```
+
+### Teams that are spending more that what they are getting
+
+```{python}
+value_results.tail(10)
+```
+
