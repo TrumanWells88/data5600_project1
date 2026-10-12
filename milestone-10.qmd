@@ -344,3 +344,800 @@ value_results.head(10)
 value_results.tail(10)
 ```
 
+```{python}
+value_results
+```
+
+```{python}
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+from pathlib import Path
+
+# Keep teams whose estimated NIL is below the model benchmark
+# Rank by the largest dollar gap
+top10 = (
+    value_results
+    .filter(pl.col('value_gap') > 0)
+    .sort('value_gap', descending=True)
+    .head(10)
+)
+
+if top10.is_empty():
+    raise ValueError("No teams have positive budget gaps.")
+
+teams = top10['team'].to_list()
+gaps = top10['value_gap'].to_list()
+
+fig, ax = plt.subplots(figsize=(11, 6.5))
+
+bars = ax.barh(
+    teams,
+    gaps,
+    color='#E58B36',
+    height=0.65
+)
+
+# Put the largest gap at the top
+ax.invert_yaxis()
+
+# Label each bar with its dollar gap
+ax.bar_label(
+    bars,
+    labels=[f'${gap:.2f}M' for gap in gaps],
+    padding=7,
+    fontsize=11
+)
+
+# Leave space for the labels
+ax.set_xlim(0, max(gaps) * 1.25)
+
+ax.xaxis.set_major_formatter(
+    FuncFormatter(lambda value, _: f'${value:g}M')
+)
+
+ax.set_title(
+    'Top 10 Teams Spending Below Their NIL Benchmark',
+    fontsize=17,
+    fontweight='bold',
+    loc='left',
+    pad=18
+)
+
+ax.set_xlabel(
+    'Model-implied NIL − estimated NIL ($ millions)',
+    fontsize=12
+)
+
+ax.tick_params(axis='y', labelsize=11, length=0)
+ax.grid(axis='x', alpha=0.2)
+ax.set_axisbelow(True)
+ax.spines[['top', 'right', 'left']].set_visible(False)
+
+fig.tight_layout()
+
+Path('figures').mkdir(exist_ok=True)
+
+fig.savefig(
+    'figures/slide-07-top10-below-benchmark.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+```
+
+```{python}
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+from pathlib import Path
+
+# Select teams whose estimated NIL exceeds the model benchmark
+top10_above = (
+    value_results
+    .filter(pl.col('value_gap') < 0)
+    .with_columns(
+        (-pl.col('value_gap')).alias('spending_above')
+    )
+    .sort('spending_above', descending=True)
+    .head(10)
+)
+
+if top10_above.is_empty():
+    raise ValueError("No teams have estimated NIL above their benchmark.")
+
+teams = top10_above['team'].to_list()
+gaps = top10_above['spending_above'].to_list()
+
+fig, ax = plt.subplots(figsize=(11, 6.5))
+
+bars = ax.barh(
+    teams,
+    gaps,
+    color='#277DA8',
+    height=0.65
+)
+
+# Largest amount above the benchmark appears first
+ax.invert_yaxis()
+
+ax.bar_label(
+    bars,
+    labels=[f'${gap:.2f}M' for gap in gaps],
+    padding=7,
+    fontsize=11
+)
+
+ax.set_xlim(0, max(gaps) * 1.25)
+
+ax.xaxis.set_major_formatter(
+    FuncFormatter(lambda value, _: f'${value:g}M')
+)
+
+ax.set_title(
+    'Top 10 Teams Spending Above Their NIL Benchmark',
+    fontsize=17,
+    fontweight='bold',
+    loc='left',
+    pad=18
+)
+
+ax.set_xlabel(
+    'Estimated NIL − model-implied NIL ($ millions)',
+    fontsize=12
+)
+
+ax.tick_params(axis='y', labelsize=11, length=0)
+ax.grid(axis='x', alpha=0.2)
+ax.set_axisbelow(True)
+ax.spines[['top', 'right', 'left']].set_visible(False)
+
+fig.tight_layout()
+
+Path('figures').mkdir(exist_ok=True)
+
+fig.savefig(
+    'figures/slide-10-top10-above-benchmark.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+```
+
+
+## Mileston 11 / Project Vizes
+
+```{python}
+# Convert the final BPR coefficient into a percentage change
+bpr_effect = 100 * np.expm1(final_fit.params['bpr'])
+
+# Convert its 95% confidence interval into percentage changes
+bpr_interval = 100 * np.expm1(
+    final_fit.conf_int().loc['bpr'].to_numpy()
+)
+
+print(f"+1 BPR is associated with {bpr_effect:.2f}% higher NIL")
+print(
+    f"95% confidence interval: "
+    f"{bpr_interval[0]:.2f}% to {bpr_interval[1]:.2f}%"
+)
+```
+
+```{python}
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, NullFormatter
+from pathlib import Path
+
+# Choose three conferences to display
+conferences = (
+    final_data['conference']
+    .value_counts()
+    .head(3)
+    .index
+    .tolist()
+)
+
+print("Conferences shown:", conferences)
+
+colors = ['#E58B36', '#277DA8', '#258678']
+
+fig, ax = plt.subplots(figsize=(11, 6))
+
+# Show all observed teams in the background
+ax.scatter(
+    final_data['bpr'],
+    final_data['nil_m'],
+    color='lightgray',
+    alpha=0.55,
+    s=28,
+    label='Other teams'
+)
+
+for conference, color in zip(conferences, colors):
+
+    teams = final_data[
+        final_data['conference'] == conference
+    ]
+
+    # Stay within the BPR range observed in this conference
+    bpr_grid = np.linspace(
+        teams['bpr'].min(),
+        teams['bpr'].max(),
+        100
+    )
+
+    # Recreate the exact predictor structure of the fitted model
+    prediction_inputs = pd.DataFrame(
+        0.0,
+        index=range(100),
+        columns=X_final.columns
+    )
+
+    prediction_inputs['const'] = 1.0
+    prediction_inputs['bpr'] = bpr_grid
+
+    # Big Ten is the reference conference
+    conference_column = f'conference_{conference}'
+
+    if conference_column in prediction_inputs.columns:
+        prediction_inputs[conference_column] = 1.0
+
+    predictions = (
+        final_fit
+        .get_prediction(prediction_inputs)
+        .summary_frame(alpha=0.05)
+    )
+
+    # Back-transform the fitted log-NIL benchmark and its interval
+    fitted_nil = np.exp(predictions['mean'].to_numpy())
+    lower = np.exp(predictions['mean_ci_lower'].to_numpy())
+    upper = np.exp(predictions['mean_ci_upper'].to_numpy())
+
+    ax.scatter(
+        teams['bpr'],
+        teams['nil_m'],
+        color=color,
+        alpha=0.7,
+        s=35
+    )
+
+    ax.plot(
+        bpr_grid,
+        fitted_nil,
+        color=color,
+        linewidth=2.5,
+        label=conference
+    )
+
+    ax.fill_between(
+        bpr_grid,
+        lower,
+        upper,
+        color=color,
+        alpha=0.12
+    )
+
+ax.set_yscale('log')
+ax.set_xlabel('Team BPR', fontsize=13)
+ax.set_ylabel('NIL budget ($ millions; log scale)', fontsize=13)
+ax.set_title('Basketball Strength and Team NIL', fontsize=18)
+
+# Display dollar amounts instead of scientific notation
+ax.yaxis.set_major_formatter(
+    FuncFormatter(lambda value, _: f'${value:g}M')
+)
+ax.yaxis.set_minor_formatter(NullFormatter())
+
+ax.grid(axis='y', alpha=0.2)
+ax.spines[['top', 'right']].set_visible(False)
+ax.legend(title='Conference / fitted benchmark', frameon=False)
+
+fig.tight_layout()
+
+# Save a high-resolution image for Google Slides
+Path('figures').mkdir(exist_ok=True)
+
+fig.savefig(
+    'figures/slide-06-bpr-nil.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+```
+
+
+## Grouping by conference
+
+```{python}
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from matplotlib.ticker import PercentFormatter
+from pathlib import Path
+
+# Common performance-only benchmark for comparing conferences
+X_bpr = sm.add_constant(
+    final_data[['bpr']],
+    has_constant='add'
+)
+
+conference_fit = sm.OLS(
+    np.log(final_data['nil_m']),
+    X_bpr
+).fit()
+
+conference_data = final_data.copy()
+
+# Positive gap: benchmark NIL is higher than estimated NIL
+conference_data['log_gap'] = (
+    conference_fit.predict(X_bpr)
+    - np.log(conference_data['nil_m'])
+)
+
+# Combine ALL teams within each conference
+conference_summary = (
+    conference_data
+    .groupby('conference', as_index=False)
+    .agg(
+        teams=('team', 'size'),
+        mean_log_gap=('log_gap', 'mean')
+    )
+)
+
+# Convert the average log gap to a percentage difference
+# This uses a geometric average of benchmark / estimated NIL
+conference_summary['gap_pct'] = (
+    100 * np.expm1(conference_summary['mean_log_gap'])
+)
+
+conference_summary = (
+    conference_summary
+    .sort_values('gap_pct', ascending=False)
+    .reset_index(drop=True)
+)
+
+print(
+    conference_summary[
+        ['conference', 'teams', 'gap_pct']
+    ].round(1).to_string(index=False)
+)
+
+# Show every conference across two columns for readability
+split = (len(conference_summary) + 1) // 2
+
+panels = [
+    conference_summary.iloc[:split],
+    conference_summary.iloc[split:]
+]
+
+limit = max(
+    conference_summary['gap_pct'].abs().max() * 1.3,
+    10
+)
+
+fig, axes = plt.subplots(
+    1, 2,
+    figsize=(16, 9),
+    sharex=True
+)
+
+for ax, panel in zip(axes, panels):
+    labels = [
+        f"{row.conference} (n={row.teams})"
+        for row in panel.itertuples()
+    ]
+
+    gaps = panel['gap_pct'].to_numpy()
+
+    colors = [
+        '#E58B36' if gap > 0 else '#277DA8'
+        for gap in gaps
+    ]
+
+    positions = range(len(panel))
+
+    bars = ax.barh(
+        positions,
+        gaps,
+        color=colors,
+        height=0.7
+    )
+
+    ax.set_yticks(list(positions))
+    ax.set_yticklabels(labels, fontsize=10)
+    ax.invert_yaxis()
+
+    ax.bar_label(
+        bars,
+        labels=[f'{gap:+.1f}%' for gap in gaps],
+        padding=5,
+        fontsize=9
+    )
+
+    ax.axvline(0, color='#444444', linewidth=1)
+    ax.set_xlim(-limit, limit)
+    ax.xaxis.set_major_formatter(
+        PercentFormatter(xmax=100, decimals=0)
+    )
+
+    ax.grid(axis='x', alpha=0.2)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis='y', length=0)
+    ax.spines[['top', 'right', 'left']].set_visible(False)
+
+axes[0].set_title('Higher-ranked conferences', fontsize=12)
+axes[1].set_title('Remaining conferences', fontsize=12)
+
+fig.suptitle(
+    'Conference NIL Relative to Basketball Strength',
+    fontsize=20,
+    fontweight='bold'
+)
+
+fig.legend(
+    handles=[
+        Patch(color='#E58B36', label='Estimated NIL below benchmark'),
+        Patch(color='#277DA8', label='Estimated NIL above benchmark')
+    ],
+    loc='upper center',
+    bbox_to_anchor=(0.5, 0.95),
+    ncol=2,
+    frameon=False
+)
+
+fig.supxlabel(
+    'Performance-only benchmark relative to estimated NIL (%)',
+    fontsize=12
+)
+
+fig.tight_layout(rect=[0, 0.05, 1, 0.89])
+
+Path('figures').mkdir(exist_ok=True)
+
+fig.savefig(
+    'figures/slide-09-all-conferences.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+```
+
+## Find USU
+
+```{python}
+usu = value_results.filter(
+    pl.col('team') == 'Utah State'
+)
+
+if usu.height != 1:
+    raise ValueError(
+        "Expected one Utah State row. Check the team names in value_results."
+    )
+
+usu_conference = usu['conference'][0]
+
+# Rank teams within USU's conference
+conference_teams = (
+    value_results
+    .filter(pl.col('conference') == usu_conference)
+    .with_columns(
+        pl.col('bpr')
+        .rank(method='min', descending=True)
+        .alias('bpr_rank'),
+
+        pl.col('value_gap')
+        .rank(method='min', descending=True)
+        .alias('gap_rank')
+    )
+)
+
+usu_result = (
+    conference_teams
+    .filter(pl.col('team') == 'Utah State')
+    .row(0, named=True)
+)
+
+estimated = float(usu_result['nil_m'])
+benchmark = float(usu_result['predicted_nil'])
+gap = float(usu_result['value_gap'])
+
+n_teams = conference_teams.height
+bpr_rank = int(usu_result['bpr_rank'])
+gap_rank = int(usu_result['gap_rank'])
+
+# Generate wording based on the actual result
+if abs(gap) < 0.005:
+    takeaway = (
+        "USU’s estimated NIL is approximately equal "
+        "to its model benchmark."
+    )
+else:
+    direction = 'below' if gap > 0 else 'above'
+    takeaway = (
+        f"USU’s estimated NIL is ${abs(gap):.2f}M "
+        f"{direction} its model benchmark."
+    )
+
+print(f"Conference: {usu_conference}")
+print(f"Team BPR: {usu_result['bpr']:.2f}")
+print(f"Estimated NIL: ${estimated:.2f}M")
+print(f"Model-implied NIL: ${benchmark:.2f}M")
+print(f"Budget gap (model minus estimated): {gap:+.2f}M")
+print(f"BPR rank within conference: {bpr_rank} of {n_teams}")
+print(f"Budget-gap rank within conference: {gap_rank} of {n_teams}")
+print(f"\nTAKEAWAY: {takeaway}")
+```
+
+```{python}
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+from pathlib import Path
+
+fig, ax = plt.subplots(figsize=(7.5, 4.5))
+
+bars = ax.barh(
+    ['Estimated NIL', 'Model-implied NIL'],
+    [estimated, benchmark],
+    color=['#102438', '#E58B36'],
+    height=0.55
+)
+
+ax.invert_yaxis()
+
+ax.bar_label(
+    bars,
+    labels=[
+        f'${estimated:.2f}M',
+        f'${benchmark:.2f}M'
+    ],
+    padding=8,
+    fontsize=14,
+    fontweight='bold'
+)
+
+ax.set_xlim(0, max(estimated, benchmark) * 1.3)
+
+ax.xaxis.set_major_formatter(
+    FuncFormatter(lambda value, _: f'${value:g}M')
+)
+
+ax.set_title(
+    'Utah State: Estimated vs. Model-Implied NIL',
+    fontsize=15,
+    fontweight='bold',
+    loc='left',
+    pad=20
+)
+
+ax.set_xlabel('Team NIL budget ($ millions)', fontsize=12)
+ax.tick_params(axis='y', labelsize=13, length=0)
+ax.grid(axis='x', alpha=0.2)
+ax.set_axisbelow(True)
+ax.spines[['top', 'right', 'left']].set_visible(False)
+
+fig.tight_layout()
+
+Path('figures').mkdir(exist_ok=True)
+
+fig.savefig(
+    'figures/slide-10-usu-case-study.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+```
+
+## USU NIL Player Allocation
+
+```{python}
+### 1. Calculate player allocations
+
+import numpy as np
+import polars as pl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+# Get USU's estimated team budget from the existing results
+usu_team = value_results.filter(
+    pl.col('team') == 'Utah State'
+)
+
+if usu_team.height != 1:
+    raise ValueError("Expected exactly one Utah State team row.")
+
+budget_dollars = (
+    float(usu_team['nil_m'][0]) * 1_000_000
+)
+
+# Use the same portal filter as Milestone 6
+usu_roster = (
+    player_data
+    .filter(
+        (pl.col('team') == 'Utah State')
+        & (pl.col('in_portal') == False)
+    )
+    .select('name', 'bpr')
+    .sort('bpr', descending=True)
+)
+
+if usu_roster.is_empty():
+    raise ValueError("No included USU players were found.")
+
+bpr = usu_roster['bpr'].to_numpy()
+
+if not np.isfinite(bpr).all():
+    raise ValueError("Every included player needs a valid BPR.")
+
+def allocate_usu(temperature):
+    # Lower temperature concentrates spending more
+    if not np.isfinite(temperature) or temperature <= 0:
+        raise ValueError("Temperature must be positive and finite.")
+
+    weights = np.exp((bpr - bpr.max()) / temperature)
+    shares = weights / weights.sum()
+
+    # Round to cents while preserving the full team budget
+    budget_cents = int(round(budget_dollars * 100))
+    raw_cents = shares * budget_cents
+    cents = np.floor(raw_cents).astype(np.int64)
+
+    remaining = budget_cents - int(cents.sum())
+    order = np.argsort(-(raw_cents - cents), kind='stable')
+    cents[order[:remaining]] += 1
+
+    return usu_roster.with_columns(
+        pl.Series('budget_share_pct', shares * 100),
+        pl.Series('allocation_dollars', cents / 100)
+    )
+
+# Editable baseline assumption
+temperature = 5.0
+usu_allocation = allocate_usu(temperature)
+
+print(f"Estimated NIL pool: ${budget_dollars:,.0f}")
+print(f"Included players: {usu_roster.height}")
+print(
+    f"Total allocated: "
+    f"${usu_allocation['allocation_dollars'].sum():,.2f}"
+)
+
+# Display the roster table
+pl.Config.set_tbl_rows(30)
+
+usu_allocation.with_columns(
+    pl.col('bpr').round(2),
+    pl.col('budget_share_pct').round(1),
+    pl.col('allocation_dollars').round(2)
+)
+
+### 2. Visualize the baseline allocation
+
+names = usu_allocation['name'].to_list()
+amounts = usu_allocation['allocation_dollars'].to_list()
+shares = usu_allocation['budget_share_pct'].to_list()
+
+fig, ax = plt.subplots(figsize=(11, 7))
+
+bars = ax.barh(
+    names,
+    amounts,
+    color='#E58B36',
+    height=0.65
+)
+
+ax.invert_yaxis()
+
+ax.bar_label(
+    bars,
+    labels=[
+        f'${amount:,.0f} ({share:.1f}%)'
+        for amount, share in zip(amounts, shares)
+    ],
+    padding=7,
+    fontsize=10
+)
+
+ax.set_xlim(0, max(amounts) * 1.4)
+ax.xaxis.set_major_formatter(
+    FuncFormatter(lambda value, _: f'${value / 1000:,.0f}k')
+)
+
+ax.set_title(
+    'How Could USU Allocate Its NIL Budget?',
+    fontsize=17,
+    fontweight='bold',
+    loc='left'
+)
+
+ax.set_xlabel('Suggested allocation (USD)')
+ax.grid(axis='x', alpha=0.2)
+ax.set_axisbelow(True)
+ax.spines[['top', 'right', 'left']].set_visible(False)
+ax.tick_params(axis='y', length=0)
+
+fig.text(
+    0.02, 0.02,
+    f'Illustrative ${budget_dollars / 1e6:.2f}M pool. '
+    f'T = {temperature:g}. Scenario allocations, not actual pay.',
+    fontsize=9
+)
+
+fig.tight_layout(rect=[0, 0.06, 1, 1])
+
+# Use here() from your existing setup to save at the project root
+output_dir = here('figures/usu-allocation')
+output_dir.mkdir(parents=True, exist_ok=True)
+
+fig.savefig(
+    output_dir / 'usu-player-allocation.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+
+### 3. Check sensitivity to the weighting assumption
+
+
+fig, ax = plt.subplots(figsize=(11, 7))
+positions = np.arange(usu_roster.height)
+
+for temp, color in [
+    (3, '#277DA8'),
+    (5, '#E58B36'),
+    (8, '#258678')
+]:
+    scenario = allocate_usu(temp)
+
+    ax.scatter(
+        scenario['allocation_dollars'].to_numpy(),
+        positions,
+        color=color,
+        s=55,
+        label=f'T = {temp}'
+    )
+
+ax.set_yticks(positions, usu_roster['name'].to_list())
+ax.invert_yaxis()
+
+ax.xaxis.set_major_formatter(
+    FuncFormatter(lambda value, _: f'${value / 1000:,.0f}k')
+)
+
+ax.set_title(
+    'How the Weighting Rule Changes Allocations',
+    fontsize=17,
+    fontweight='bold',
+    loc='left'
+)
+
+ax.set_xlabel('Suggested allocation (USD)')
+ax.grid(axis='x', alpha=0.2)
+ax.set_axisbelow(True)
+ax.spines[['top', 'right', 'left']].set_visible(False)
+ax.tick_params(axis='y', length=0)
+ax.legend(title='Weighting temperature', frameon=False,
+          loc='center right')
+
+fig.text(
+    0.02, 0.02,
+    'Lower T concentrates the budget more. '
+    'Higher T distributes it more evenly. '
+    'Every setting allocates the same team pool.',
+    fontsize=9
+)
+
+fig.tight_layout(rect=[0, 0.06, 1, 1])
+
+fig.savefig(
+    output_dir / 'usu-player-allocation-sensitivity.png',
+    dpi=300,
+    bbox_inches='tight'
+)
+
+plt.show()
+```
