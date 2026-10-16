@@ -276,37 +276,774 @@ These results show that the estimations can recover the relationships when we as
 
 ## Data Sources and Collection
 
+This analysis uses two datasets:
 
+The first dataset is from [EvanMiya](https://evanmiya.com/)
+
+The second data set is from [The Sideline Men's Basketball NIL Tracker](https://thesideline.co/nil-tracker/basketball)
+
+Both datasets are downloaded as CSV files and were joined using school names. Since the tow sources has different names for some schools, they were standardized before merging.
 
 ## Data Cleaning and Preparation
 
+### Load datasets
+
+```{python}
+from pyprojroot.here import here
+
+# Load the original 2026-27 team ratings and NIL estimates
+team_data = pl.read_csv(
+    here('data/evanmiya_team_ratings_2026_27.csv')
+)
+
+nil_data = pl.read_csv(
+    here('data/sideline-basketball-nil-rankings.csv'),
+    skip_rows=3
+)
+
+print("EvanMiya observations:", team_data.height)
+print("Sideline observations:", nil_data.height)
+print("EvanMiya columns:", team_data.columns)
+print("Sideline columns:", nil_data.columns)
+```
+
+### Standardize school names
+
+```{python}
+# Standardize Sideline school names to match EvanMiya
+school_names = {
+  'American University': 'American', 'Detroit Mercy': 'Detroit', 'FIU': 'Florida International',
+  'Grambling State': 'Grambling', 'IU Indianapolis': 'IU Indy', 'LIU': 'Long Island',
+  'Louisiana': 'Louisiana-Lafayette', 'Louisiana Monroe': 'Louisiana-Monroe',
+  'Loyola (Maryland)': 'Loyola Maryland', 'Maryland Eastern Shore': 'Maryland-Eastern Shore',
+  'McNeese': 'McNeese State', 'Miami (FL)': 'Miami (Fla.)', 'NC A&T': 'North Carolina A&T',
+  'NC Central': 'North Carolina Central', 'Nicholls': 'Nicholls State', 'Prairie View A&M': 'Prairie View',
+  'Purdue Fort Wayne': 'Fort Wayne', 'Queens University': 'Queens', 'SE Missouri State': 'Southeast Missouri State',
+  'SIUE': 'SIU Edwardsville', 'Sam Houston': 'Sam Houston State', 'Seattle University': 'Seattle',
+  'Southern Miss': 'Southern Mississippi', 'St. Thomas': 'St. Thomas (MN)', 'UConn': 'Connecticut',
+  'UIC': 'Illinois-Chicago', 'USC Upstate': 'South Carolina Upstate', 'UT Martin': 'Tennessee-Martin',
+  'UTRGV': 'Texas-Rio Grande Valley'
+}
+tier_names = {'Power 4': 'Power4', 'Lower-Tier': 'LowerTier'}
+
+
+# Clean Sideline data and include conference
+nil_clean = (
+    nil_data
+    .select(
+        pl.col('School').alias('team'),
+        pl.col('Tier').alias('tier'),
+        pl.col('Conference').alias('conference'),
+        pl.col("Men's Basketball NIL Estimate ($M)").alias('nil_m')
+    )
+    .with_columns(
+        pl.col('team').replace(school_names),
+        pl.col('tier').replace(tier_names),
+        pl.col('conference').str.replace_all('[^A-Za-z0-9]', ''),
+        pl.col('nil_m').cast(pl.Float64, strict=False)
+    )
+    .unique()
+)
+
+
+# Keep only the useful EvanMiya columns
+team_clean = (team_data
+  .select('team', 'rank', 'obpr', 'dbpr', 'bpr', 'tempo')
+  .unique()
+)
+
+# Join teams with a NIL estimate and log-transform NIL
+tm_data = (team_clean
+  .join(nil_clean, on = 'team', how = 'inner')
+  .with_columns(pl.col('nil_m').log().alias('log_nil'))
+)
+```
+
+### Join datasets
+
+```{python}
+
+# Join EvanMiya ratings with Sideline NIL estimates
+tm_data = (
+    team_clean
+    .join(nil_clean, on='team', how='inner', validate='1:1')
+    .with_columns(
+        pl.col('nil_m').log().alias('log_nil')
+    )
+    .sort('team')
+)
+
+# Verify the final columns
+print(tm_data.columns)
+print("Matched teams:", tm_data.height)
+
+```
+
+
+
 ## Descriptive Statistics
+
+### Check missing data
+
+```{python}
+# Teams in EvanMiya without a matching Sideline record
+dropped = team_clean.join(
+    nil_clean.select('team'),
+    on='team',
+    how='anti'
+)
+
+# Sideline teams without a matching EvanMiya record
+unmatched_nil = nil_clean.join(
+    team_clean.select('team'),
+    on='team',
+    how='anti'
+)
+
+# Summarize matching coverage
+coverage = pl.DataFrame({
+    'source': [
+        'EvanMiya teams',
+        'Sideline teams',
+        'Matched teams',
+        'Unmatched EvanMiya',
+        'Unmatched Sideline'
+    ],
+    'teams': [
+        team_clean.height,
+        nil_clean.height,
+        tm_data.height,
+        dropped.height,
+        unmatched_nil.height
+    ]
+})
+
+print(coverage)
+
+print("EvanMiya teams excluded:")
+print(dropped.select('team', 'bpr').sort('bpr'))
+
+print("Missing values in the matched data:")
+print(tm_data.null_count())
+```
+
+### Overall Descriptive Statistics
+
+```{python}
+
+# Describe the outcome, primary predictor, and sample
+overall_summary = tm_data.select(
+    pl.len().alias('teams'),
+    pl.col('conference').n_unique().alias('conferences'),
+    pl.col('nil_m').mean().alias('mean_nil_m'),
+    pl.col('nil_m').median().alias('median_nil_m'),
+    pl.col('nil_m').min().alias('min_nil_m'),
+    pl.col('nil_m').max().alias('max_nil_m'),
+    pl.col('bpr').mean().alias('mean_bpr'),
+    pl.col('bpr').std().alias('sd_bpr'),
+    pl.corr('bpr', 'log_nil').alias('cor_bpr_log_nil')
+)
+
+overall_summary.with_columns(
+    pl.col(pl.Float64).round(3)
+)
+```
+
+### By tier
+
+```{python}
+# Summarize NIL and projected team strength by tier
+tier_summary = (
+    tm_data
+    .group_by('tier')
+    .agg(
+        teams=pl.len(),
+        mean_nil_m=pl.col('nil_m').mean(),
+        median_nil_m=pl.col('nil_m').median(),
+        mean_bpr=pl.col('bpr').mean(),
+        sd_bpr=pl.col('bpr').std(),
+        correlation=pl.corr('bpr', 'log_nil')
+    )
+    .sort('median_nil_m', descending=True)
+)
+
+tier_summary.with_columns(
+    pl.col(pl.Float64).round(3)
+)
+```
 
 ## Exploratory Data Analysis
 
+### Viz 1: Estimated NIL distribution
+
+```{python}
+(ggplot(tm_data, aes(x='nil_m'))
+    + geom_histogram(bins=25)
+    + labs(
+        title='Distribution of Team NIL Estimates',
+        x='Estimated Team NIL ($ millions)',
+        y='Number of Teams'
+    )
+    + theme_minimal()
+)
+```
+
+
+### Viz 2: Log NIL
+
+```{python}
+(ggplot(tm_data, aes(x='log_nil'))
+    + geom_histogram(bins=25)
+    + labs(
+        title='Distribution of Log NIL',
+        x='Log Estimated NIL ($ millions)',
+        y='Number of Teams'
+    )
+    + theme_minimal()
+)
+```
+
+### Viz 3: BPR and Log NIL
+
+```{python}
+(ggplot(tm_data, aes(x='bpr', y='log_nil'))
+    + geom_point(aes(color='tier'), alpha=0.55)
+    + geom_smooth(
+        method='lm',
+        se=False,
+        color='black'
+    )
+    + labs(
+        title='Projected BPR and Estimated NIL',
+        x='Projected Team BPR',
+        y='Log Estimated NIL ($ millions)',
+        color='Market Tier'
+    )
+    + theme_minimal()
+)
+```
+
+### Viz 4: NIL estimates  by tier
+
+```{python}
+(ggplot(tm_data, aes(x='tier', y='log_nil', fill='tier'))
+    + geom_boxplot()
+    + coord_flip()
+    + labs(
+        title='Log NIL Estimates by Market Tier',
+        x='Market Tier',
+        y='Log Estimated NIL ($ millions)'
+    )
+    + theme_minimal()
+    + theme(legend_position='none')
+)
+```
+
+```{python}
+
+# Final summary of the actual merged team data
+eda_overall = tm_data.select(
+    pl.len().alias('teams'),
+    pl.col('conference').n_unique().alias('conferences'),
+    pl.col('nil_m').mean().alias('mean_nil'),
+    pl.col('nil_m').median().alias('median_nil'),
+    pl.col('nil_m').min().alias('min_nil'),
+    pl.col('nil_m').max().alias('max_nil'),
+    pl.col('nil_m').skew().alias('nil_skew'),
+    pl.col('log_nil').skew().alias('log_nil_skew'),
+    pl.col('bpr').mean().alias('mean_bpr'),
+    pl.col('bpr').std().alias('sd_bpr'),
+    pl.corr('bpr', 'log_nil').alias('correlation'),
+    pl.col('nil_m')
+      .filter(pl.col('nil_m').is_between(0.2999, 0.3001))
+      .count()
+      .alias('teams_at_0_3m')
+)
+
+# Summary of team characteristics by market tier
+eda_tiers = (
+    tm_data
+    .group_by('tier')
+    .agg(
+        teams=pl.len(),
+        mean_nil=pl.col('nil_m').mean(),
+        median_nil=pl.col('nil_m').median(),
+        mean_bpr=pl.col('bpr').mean(),
+        correlation=pl.corr('bpr', 'log_nil')
+    )
+    .sort('median_nil', descending=True)
+)
+
+# Compare matched and unmatched programs
+unmatched = team_clean.join(
+    nil_clean.select('team'),
+    on='team',
+    how='anti'
+)
+
+eda_coverage = pl.DataFrame({
+    'group': ['Matched', 'Unmatched'],
+    'teams': [tm_data.height, unmatched.height],
+    'mean_bpr': [
+        tm_data['bpr'].mean(),
+        unmatched['bpr'].mean()
+    ]
+})
+
+with pl.Config(tbl_cols=20, tbl_width_chars=180):
+    print("\nOVERALL SUMMARY")
+    print(eda_overall.with_columns(pl.col(pl.Float64).round(3)))
+
+    print("\nTIER SUMMARY")
+    print(eda_tiers.with_columns(pl.col(pl.Float64).round(3)))
+
+    print("\nSAMPLE COVERAGE")
+    print(eda_coverage.with_columns(pl.col(pl.Float64).round(3)))
+
+    print("\nMISSING VALUES")
+    print(tm_data.null_count())
+
+```
+
+
 ## Data Limitations
+
+We have a couple of limitations that affect the interpretation and gereralizability of our data
+
+First, some of our NIL estimates from Sideline are a modeled values rather than the verified compensation. So our outcome should be interpreted as estimated NIL market and not the actual audit
+
+Second, the analysis uses cross-sectional data froma single season. It doesn't capture how changes in NIL spending affect performance over time, and it doesn't account for other facotrs like program history, popularity, recruiting, donors, or how a player has a specific relationship with a college
+
 
 # Reconcile
 
+Following our workflow, we start with a linear model predicting log NIL from BPR and market. We then look into whether conference give a better representation of differences between schools.
+
+Our model diagnostics are conducted using our training data, while the held-out test data are kept for the predictive model evaluation. This divide reduces the risk of choosing a model based on its performance on data just to evaluate it
+
 ## Validity and Representativeness
+
+### Validity
+
+The validity of our analysis depends on whether our variables represent our objective. Our objective is to build NIL benchmarks associated with basketball strength and conference.
+
+BPR gives us a quantitative measure of team performance, and Sideline's estimated NIL values give us a reference for financial resources. Both variables are relevant to our objective, although neither directly measures realized performance or verfied NIL value
+
+### Representativeness
+
+We have 353 of the 365 teams from our datasets which 96.7% coverage.
+
+The 12 unmatched programs have an average projected BPR of -8.539, compared with 0.289 among matched programs. This difference suggests that lower-performing teams are underrepresented in the analytical sample.
+
+Our data will be examines using DFFITS. Big influence stats can identify teams that substantially affect fitted values, but those teams will not be removed just because they are unusual. 
+
 
 ## Linearity
 
+### 80/20 Split
+
+```{python}
+from sklearn.model_selection import train_test_split
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import statsmodels.api as sm
+
+# Sort teams for reproducibility
+model_data = tm_data.sort('team')
+
+# Reserve 20% of observations for final model evaluation
+train_raw, test_raw = train_test_split(
+    model_data,
+    test_size=0.20,
+    random_state=42
+)
+
+print("Training observations:", train_raw.height)
+print("Testing observations:", test_raw.height)
+print("Training conferences:", train_raw['conference'].n_unique())
+
+# Verify both sets contain different teams
+assert not (
+    set(train_raw['team'].to_list())
+    & set(test_raw['team'].to_list())
+)
+```
+
+### Fit the BPR and Tier model
+
+```{python}
+
+# Create tier indicator variables (Power4 is the reference)
+tier_train = (
+    train_raw
+    .to_dummies(columns=['tier'], drop_first=False)
+    .select(pl.exclude('tier_Power4'))
+)
+
+tier_cols = sorted(
+    c for c in tier_train.columns
+    if c.startswith('tier_')
+)
+
+# Estimate log NIL from BPR and market tier
+fit_tier = smf.ols(
+    'log_nil ~ bpr + ' + ' + '.join(tier_cols),
+    data=tier_train.to_pandas()
+).fit()
+
+# Attach residuals and fitted values in their original row order
+tier_diag = tier_train.with_columns(
+    pl.Series('resid_tier', fit_tier.resid.to_numpy()),
+    pl.Series('fitted_tier', fit_tier.fittedvalues.to_numpy())
+)
+
+print("Initial R-squared:", round(fit_tier.rsquared, 3))
+print("Initial adjusted R-squared:", round(fit_tier.rsquared_adj, 3))
+print("BPR coefficient:", round(fit_tier.params['bpr'], 4))
+```
+
+### Linearity Viz
+
+```{python}
+(ggplot(tier_diag, aes(x='fitted_tier', y='resid_tier'))
+    + geom_point(alpha=0.35)
+    + geom_smooth(method='lowess', se=False, color='red')
+    + geom_hline(yintercept=0, linetype='dashed')
+    + labs(
+        title='Initial Model: Residuals vs. Fitted Values',
+        x='Fitted Log NIL',
+        y='Residual'
+    )
+    + theme_minimal()
+)
+```
+
+
 ## Independence
+
+### See the conference residuals
+
+```{python}
+# Check whether conferences are nested within tiers
+tier_nesting = (
+    train_raw
+    .group_by('conference')
+    .agg(n_tiers=pl.col('tier').n_unique())
+)
+
+print(
+    "Maximum tiers per conference:",
+    tier_nesting['n_tiers'].max()
+)
+
+# Summarize residuals from the initial tier model by conference
+conf_resid_initial = (
+    tier_diag
+    .group_by('conference')
+    .agg(
+        teams=pl.len(),
+        mean_residual=pl.col('resid_tier').mean()
+    )
+    .sort('mean_residual')
+)
+
+# Display conferences with the largest negative and positive means
+with pl.Config(tbl_rows=12):
+    print(
+        pl.concat([
+            conf_resid_initial.head(5),
+            conf_resid_initial.tail(5)
+        ])
+    )
+```
+
+### Do model again with conference instead of tier
+
+```{python}
+# Replace market tier with conference indicators
+# Big Ten is the reference conference
+cf_train = (
+    train_raw
+    .to_dummies(columns=['conference'], drop_first=False)
+    .select(pl.exclude('conference_BigTen'))
+)
+
+conf_cols = sorted(
+    c for c in cf_train.columns
+    if c.startswith('conference_')
+)
+
+assert 'conference_BigTen' not in conf_cols
+
+# Fit conference-adjusted OLS
+fit_conf = smf.ols(
+    'log_nil ~ bpr + ' + ' + '.join(conf_cols),
+    data=cf_train.to_pandas()
+).fit()
+
+
+# Save residuals and fitted values, preserving conference names
+cf_diag = (
+    cf_train
+    .with_columns(
+        pl.Series('resid_conf', fit_conf.resid.to_numpy()),
+        pl.Series('fitted_conf', fit_conf.fittedvalues.to_numpy())
+    )
+    .join(
+        train_raw.select('team', 'conference'),
+        on='team',
+        how='left',
+        validate='1:1'
+    )
+)
+
+# Verify conference is included
+print(cf_diag.columns)
+
+# Compare in-sample model fit
+fit_comparison = pl.DataFrame({
+    'model': ['BPR + Tier', 'BPR + Conference'],
+    'r_squared': [
+        fit_tier.rsquared,
+        fit_conf.rsquared
+    ],
+    'adjusted_r_squared': [
+        fit_tier.rsquared_adj,
+        fit_conf.rsquared_adj
+    ],
+    'residual_sd': [
+        np.sqrt(fit_tier.mse_resid),
+        np.sqrt(fit_conf.mse_resid)
+    ]
+})
+
+print("Conference indicators:", len(conf_cols))
+print(fit_comparison)
+```
+
+
+### Check model again rq
+
+```{python}
+(ggplot(cf_diag, aes(x='fitted_conf', y='resid_conf'))
+    + geom_point(alpha=0.35)
+    + geom_smooth(method='lowess', se=False, color='red')
+    + geom_hline(yintercept=0, linetype='dashed')
+    + labs(
+        title='Conference-Adjusted Model Residuals',
+        x='Fitted Log NIL',
+        y='Residual'
+    )
+    + theme_minimal()
+)
+```
+
+The inital specfication models log NIL using BPR and market tier as the indicators. We then looked at conference residuals to see whether variation stayed within the market classifications
+
+Because each conference belongs to a tier in the data, tier and conference indicators overlap information. That would be perfect multicollinearity.
+
+So we replaced tier with conference. The new model has conference-specific intercepts while keeping a common BPR slope, with the Big Ten as our reference group
+
+The adjustment is supposed to account for the fundamental difference in epxected NIL between conferences.
+
 
 ## Constant Variance
 
+### Breusch-Pagan Test
+
+```{python}
+# Test for nonconstant residual variance
+bp_lm, bp_pvalue, bp_f, bp_f_pvalue = het_breuschpagan(
+    fit_conf.resid,
+    fit_conf.model.exog
+)
+
+print("Breusch-Pagan LM statistic:", round(bp_lm, 3))
+print("Breusch-Pagan p-value:", round(bp_pvalue, 4))
+print("Breusch-Pagan F-test p-value:", round(bp_f_pvalue, 4))
+```
+
 ## Normality
+
+### Q-Q Plot
+
+```{python}
+(ggplot(cf_diag, aes(sample='resid_conf'))
+    + stat_qq(alpha=0.4)
+    + stat_qq_line(color='red')
+    + labs(
+        title='Normal Q-Q Plot: Conference Model',
+        x='Theoretical Quantiles',
+        y='Sample Residual Quantiles'
+    )
+    + theme_minimal()
+)
+```
+
+Our Q-Q Plot points close to the reference line which suggests normality. We have a little tail in the end which could be a problem, but we should not automatically remove those teams
+
+### Look at large residuals
+
+```{python}
+
+# Identify the largest positive and negative residuals
+positive_residuals = (
+    cf_diag
+    .sort('resid_conf', descending=True)
+    .select('team', 'conference', 'tier', 'nil_m', 'bpr', 'resid_conf')
+    .head(5)
+)
+
+negative_residuals = (
+    cf_diag
+    .sort('resid_conf')
+    .select('team', 'conference', 'tier', 'nil_m', 'bpr', 'resid_conf')
+    .head(5)
+)
+
+print("Largest positive residuals:")
+print(positive_residuals)
+
+print("Largest negative residuals:")
+print(negative_residuals)
+```
 
 ## Identifiability
 
+### Check design-matrix rank
+
+```{python}
+# Compare design-matrix rank with the number of columns
+design_matrix = fit_conf.model.exog
+
+matrix_rank = np.linalg.matrix_rank(design_matrix)
+n_parameters = design_matrix.shape[1]
+
+print("Design-matrix rank:", matrix_rank)
+print("Number of model parameters:", n_parameters)
+print("Full column rank:", matrix_rank == n_parameters)
+```
+
+### Calculate Variance Inflation Factors
+
+```{python}
+
+# Construct numerical predictor matrix including an intercept
+vif_design = sm.add_constant(
+    cf_train.select(['bpr'] + conf_cols).to_pandas(),
+    has_constant='add'
+).astype(float)
+
+# Compute VIF for predictors, excluding the intercept
+vif_table = pl.DataFrame({
+    'predictor': list(vif_design.columns[1:]),
+    'vif': [
+        variance_inflation_factor(vif_design.values, i)
+        for i in range(1, vif_design.shape[1])
+    ]
+}).sort('vif', descending=True)
+
+print("Highest VIF values:")
+print(vif_table.head(10))
+
+print("Maximum VIF:", round(vif_table['vif'].max(), 3))
+```
+
 ## Model Refinements
+
+### Identify Influential Teams
+
+```{python}
+# Calculate influence diagnostics
+influence = fit_conf.get_influence()
+dffits_values = influence.dffits[0]
+
+# Conventional screening threshold
+n = train_raw.height
+p = len(fit_conf.params)
+
+dffits_cutoff = 2 * np.sqrt(p / n)
+
+# Attach influence measures to the training observations
+influence_data = cf_diag.with_columns(
+    pl.Series('dffits', dffits_values),
+    pl.Series('abs_dffits', np.abs(dffits_values))
+)
+
+influential_teams = (
+    influence_data
+    .filter(pl.col('abs_dffits') > dffits_cutoff)
+    .sort('abs_dffits', descending=True)
+    .select(
+        'team', 'conference', 'nil_m',
+        'bpr', 'resid_conf', 'dffits'
+    )
+)
+
+print("DFFITS threshold:", round(dffits_cutoff, 3))
+print("Potentially influential teams:", influential_teams.height)
+print(influential_teams.head(10))
+```
 
 # Fit
 
 ## Ordinary Least Squares
 
+We used OLS because it estimates regression coefficients by minimizing the sum of squared residuals between oberved and predicted vales. 
+
+Our model is:
+
+$$
+\log(Y_i)=\beta_0+\beta_1 BPR_i+
+\sum_{c\ne\text{BigTen}}\gamma_c I(C_i=c)+\epsilon_i
+$$
+
+Where $Y_i$ is estimated team NIL in millions of dollars, $\beta_1$ represents the association between BPR and log NIL, and $\gamma_c$ represents the difference associated with conference membership relative to the Big Ten.
+
+```{python}
+# Reuse the conference-adjusted training model
+fr_fit = fit_conf
+
+# Report key OLS model statistics
+ols_summary = pl.DataFrame({
+    'statistic': [
+        'Training observations',
+        'R-squared',
+        'Adjusted R-squared',
+        'Residual standard error',
+        'Model F-test p-value'
+    ],
+    'value': [
+        fr_fit.nobs,
+        fr_fit.rsquared,
+        fr_fit.rsquared_adj,
+        np.sqrt(fr_fit.mse_resid),
+        fr_fit.f_pvalue
+    ]
+})
+
+print(
+    ols_summary.with_columns(
+        pl.col('value').round(4)
+    )
+)
+```
+
 ## Frequentist Inference
+
+Frequentist treats the parameters as fixed but unknown quatites. We quantify estimation ucertainty using standard errors, 95% confience intervals, and hypothesis tests.
+
+For each coefficient, we test the null hypothesis that the parameter equals zero. A coefficient is statistically significant at the 5% level when its corresponding two-sided p-value is below 0.05, assuming the model and assumptions are met
+
+A 95% confidence interval is constructed using a procedure that would contain the true population parameter in approximately 95% of repeated samples under the model assumptions. It is not a direct 95% probability statement about the fixed parameter.
+
+Since the response variable is log NIL, coefficients are converted to percentage differences on the original NIL scale:
+
+$$
+100(e^{\hat{\beta}}-1)
+$$
+
+This transformation gives an easier way to interpreted our results
 
 ## Bayesian Inference
 
