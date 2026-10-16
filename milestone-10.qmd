@@ -1141,3 +1141,86 @@ fig.savefig(
 
 plt.show()
 ```
+
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+required = ['simple_rmse', 'full_rmse', 'simple_loss', 'full_loss']
+missing = [name for name in required if name not in globals()]
+if missing:
+    raise NameError(
+        'Run the existing model and Decision chunks first. Missing: '
+        + ', '.join(missing)
+    )
+
+# Existing loss values are MSE in (million dollars)^2.
+# Taking the square root expresses RMSE in $ millions.
+simple_dollar_rmse = float(np.sqrt(simple_loss))
+full_dollar_rmse = float(np.sqrt(full_loss))
+
+choice_comparison = pd.DataFrame({
+    'Model': ['BPR only', 'BPR + conference'],
+    'Held-out log RMSE': [simple_rmse, full_rmse],
+    'Held-out NIL MSE ($M squared)': [simple_loss, full_loss],
+    'Held-out NIL RMSE ($M)': [simple_dollar_rmse, full_dollar_rmse]
+})
+
+winning_model = choice_comparison.loc[
+    choice_comparison['Held-out NIL RMSE ($M)'].idxmin(), 'Model'
+]
+
+improvement = 100 * (1 - full_dollar_rmse / simple_dollar_rmse)
+
+print(choice_comparison.round(3).to_string(index=False))
+print(f'\nSelected by dollar-scale loss: {winning_model}')
+print(f'Dollar RMSE reduction from adding conference: {improvement:.1f}%')
+```
+
+```{python}
+models = choice_comparison['Model'].tolist()
+errors = choice_comparison['Held-out NIL RMSE ($M)'].tolist()
+colors = [
+    '#E58B36' if model == winning_model else '#AEBBC7'
+    for model in models
+]
+
+fig, ax = plt.subplots(figsize=(8.5, 4.7))
+
+bars = ax.barh(models, errors, color=colors, height=0.5)
+ax.invert_yaxis()
+ax.bar_label(
+    bars,
+    labels=[f'${error:.2f}M' for error in errors],
+    padding=8,
+    fontsize=14,
+    fontweight='bold'
+)
+
+ax.set_xlim(0, max(errors) * 1.3)
+ax.xaxis.set_major_formatter(
+    FuncFormatter(lambda value, _: f'${value:g}M')
+)
+ax.set_xlabel('Held-out NIL benchmark RMSE ($ millions)', fontsize=12)
+ax.set_title('Comparing NIL Benchmark Prediction Error',
+             fontsize=17, fontweight='bold', loc='left', pad=18)
+ax.tick_params(axis='y', labelsize=13, length=0)
+ax.grid(axis='x', alpha=0.18)
+ax.set_axisbelow(True)
+ax.spines[['top', 'right', 'left']].set_visible(False)
+
+fig.text(0.02, 0.02,
+         'Same 71 held-out teams. Lower RMSE is better. '
+         'Budgets are source estimates.', fontsize=9, color='#546574')
+fig.tight_layout(rect=[0, 0.065, 1, 1])
+
+output_dir = here('figures')
+output_dir.mkdir(parents=True, exist_ok=True)
+fig.savefig(output_dir / 'model-choice-comparison.png',
+            dpi=300, bbox_inches='tight')
+plt.show()
+```
+
