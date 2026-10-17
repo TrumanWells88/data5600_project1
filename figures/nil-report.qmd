@@ -2,6 +2,18 @@
 title: "NIL Investment Analysis Report"
 ---
 
+# Executive Summary
+
+This report examines the relationship between projected basketball performance and estimated Name, Image, and Likeness (NIL) valuations across NCAA Division I men's basketball programs. Our objective is to develop a statistical benchmark that allows programs to compare their estimated NIL resources with teams of similar projected strength and conference affiliation.
+
+We combined EvanMiya preseason basketball ratings with NIL estimates from The Sideline, producing a dataset of 353 teams across 32 conferences. Using multiple linear regression, we evaluated projected Bayesian Performance Rating (BPR) and conference affiliation as predictors of log-transformed NIL valuations.
+
+The conference-adjusted model substantially outperformed the BPR-only model on the held-out test dataset. Test RMSE decreased from $1.683 million to $0.941 million, while mean squared error decreased by approximately 68.7%. These results support incorporating conference information when estimating NIL benchmarks.
+
+We then applied the selected model to identify programs with estimated NIL valuations above or below their model-implied benchmarks, including a case study of Utah State University.
+
+The analysis provides a framework for evaluating relative NIL valuations and identifying programs for further investigation. However, the data consist of modeled NIL estimates and projected basketball ratings, so the findings should not be interpreted as verified expenditures, causal effects, or optimal funding recommendations.
+
 # Plan
 
 ## Business Objective
@@ -1045,7 +1057,144 @@ $$
 
 This transformation gives an easier way to interpreted our results
 
+### Calculate coefficient estimates and intervals
+
+```{python}
+
+# Estimate standard 95% OLS confidence intervals
+fr_ci = fr_fit.conf_int(alpha=0.05)
+
+# Organize coefficient estimates and uncertainty
+fr_table = (
+    pl.DataFrame({
+        'term': fr_fit.params.index.tolist(),
+        'estimate': fr_fit.params.to_numpy(),
+        'lower': fr_ci.iloc[:, 0].to_numpy(),
+        'upper': fr_ci.iloc[:, 1].to_numpy(),
+        'p_value': fr_fit.pvalues.to_numpy()
+    })
+    .with_columns(
+        pct_estimate=(pl.col('estimate').exp() - 1) * 100,
+        pct_lower=(pl.col('lower').exp() - 1) * 100,
+        pct_upper=(pl.col('upper').exp() - 1) * 100,
+        significant=pl.col('p_value') < 0.05
+    )
+)
+
+# Display selected coefficients relevant to the business objective
+selected_terms = [
+    'bpr',
+    'conference_BigEast',
+    'conference_SEC',
+    'conference_WestCoast'
+]
+
+(
+    fr_table
+    .filter(pl.col('term').is_in(selected_terms))
+    .select(
+        'term',
+        'pct_estimate',
+        'pct_lower',
+        'pct_upper',
+        'p_value',
+        'significant'
+    )
+    .with_columns(pl.col(pl.Float64).round(3))
+)
+```
+
 ## Bayesian Inference
+
+Bayesian gives a different way for estimating regression paramters and quantifying uncertainty. 
+
+The theory is that you combine prior inormation with the likelihood of the observed data to get posterior parameter distributions
+
+$$
+p(\theta\mid D)\propto p(D\mid\theta)p(\theta)
+$$
+
+
+Following the course methodology, we specify diffuse uniform priors for the regression coefficients and an exponential prior for the residual standard deviation:
+
+$$
+\beta_j\sim Uniform(-100,100)
+$$
+
+$$
+\sigma\sim Exponential(1)
+$$
+
+These priors place relatively weak restrictions on the regression coefficients over the selected ranges. The uniform bounds are intentionally broad and are not based on substantive NIL market information. They nevertheless remain assumptions of the Bayesian model.
+
+### Bayesian Regression
+
+```{python}
+import arviz as az
+import pytensor
+
+# Match the PyTensor configuration from Milestone 9
+pytensor.config.cxx = ""
+
+import bambi as bmb
+
+# Reuse precisely the same predictors and observations as OLS
+bayes_predictors = ['bpr'] + conf_cols
+
+bayes_data = cf_train.select(
+    ['log_nil'] + bayes_predictors
+).to_pandas()
+
+bayes_formula = (
+    'log_nil ~ ' + ' + '.join(bayes_predictors)
+)
+
+# Specify the Gaussian regression model
+ba_model = bmb.Model(
+    bayes_formula,
+    data=bayes_data,
+    family='gaussian'
+)
+
+# Define the priors used in Milestone 9
+priors_dict = {
+    'Intercept': bmb.Prior(
+        'Uniform', lower=-100, upper=100
+    ),
+    **{
+        term: bmb.Prior(
+            'Uniform', lower=-100, upper=100
+        )
+        for term in bayes_predictors
+    },
+    'sigma': bmb.Prior('Exponential', lam=1)
+}
+
+ba_model.set_priors(priors=priors_dict)
+
+# Sample the posterior distributions
+ba_fit = ba_model.fit(
+    draws=2000,
+    tune=2000,
+    chains=4,
+    cores=2,
+    target_accept=0.90,
+    random_seed=42
+)
+```
+
+### Comparing both models
+
+The frequentist and Bayesian models estimate the relationship between projected basketball performance and estimated NIL valuations while controlling for conference affiliation. Because both models use the same response, predictors, and training observations, their parameter estimates and uncertainty intervals can be compared directly.
+
+The BPR coefficient represents the conditional association between a one-point difference in projected basketball strength and log NIL, holding conference fixed. Exponentiating the coefficient converts this relationship into a percentage difference in NIL valuations.
+
+Conference coefficients represent differences relative to the Big Ten, holding projected BPR constant. These estimates describe conditional differences in NIL valuations across conferences rather than causal effects of conference membership.
+
+Frequentist confidence intervals and Bayesian credible intervals have different interpretations. A 95% confidence interval refers to the long-run coverage of an estimation procedure, while a 95% credible interval represents posterior uncertainty about the parameter conditional on the specified prior and likelihood.
+
+The resulting coefficient estimates will inform our interpretation of the NIL market, while their predictive usefulness will be assessed separately using held-out observations in the Evaluate stage.
+
 
 # Evaluate
 
@@ -1053,26 +1202,323 @@ This transformation gives an easier way to interpreted our results
 
 ## Model Comparison
 
-## Predictive Performance and Loss
+```{python}
+import pandas as pd
 
-## Final Model Selection
+# Model 1: BPR alone, fitted on the original training sample
+fit_bpr = smf.ols(
+    'log_nil ~ bpr',
+    data=train_raw.to_pandas()
+).fit()
+
+# Model 2: BPR + Conference, already fitted in Reconcile
+fit_conference = fit_conf
+
+# Prepare the held-out test observations
+test_pd = test_raw.to_pandas()
+
+# Check for unseen conference categories
+unseen = (
+    set(test_raw['conference'].to_list())
+    - set(train_raw['conference'].to_list())
+)
+assert not unseen, f"Unseen test conferences: {unseen}"
+
+# Match the test dummy columns to the training specification
+test_dummies = pd.get_dummies(
+    test_pd['conference'],
+    prefix='conference',
+    dtype=int
+).reindex(columns=conf_cols, fill_value=0)
+
+test_design = pd.concat(
+    [
+        test_pd[['bpr']].reset_index(drop=True),
+        test_dummies.reset_index(drop=True)
+    ],
+    axis=1
+)
+
+# Generate predictions on the log scale
+pred_bpr_log = fit_bpr.predict(test_pd)
+pred_conf_log = fit_conference.predict(test_design)
+
+# Apply smearing corrections estimated using training residuals
+smear_bpr = np.mean(np.exp(fit_bpr.resid))
+smear_conf = np.mean(np.exp(fit_conference.resid))
+
+pred_bpr = np.exp(pred_bpr_log) * smear_bpr
+pred_conf = np.exp(pred_conf_log) * smear_conf
+
+# Evaluate predictions against observed NIL estimates ($ millions)
+actual_nil = test_pd['nil_m'].to_numpy()
+
+def evaluate_predictions(name, prediction):
+    errors = actual_nil - np.asarray(prediction)
+    mse = np.mean(errors ** 2)
+    return {
+        'model': name,
+        'MSE ($M squared)': mse,
+        'RMSE ($M)': np.sqrt(mse),
+        'MAE ($M)': np.mean(np.abs(errors))
+    }
+
+model_results = pl.DataFrame([
+    evaluate_predictions('BPR only', pred_bpr),
+    evaluate_predictions('BPR + Conference', pred_conf)
+])
+
+print(model_results.with_columns(
+    pl.col(pl.Float64).round(3)
+))
+```
+
+The two regression models were evaluated using 71 held-out observations, representing 20% of the analytical dataset. Both models predict estimated NIL valuations from projected BPR, but the second model additionally controls for conference membership. Predictions were converted from log NIL to estimated NIL in millions of dollars using a smearing adjustment based on the training residuals.
+
+The BPR-only model produced a test MSE of 2.832 ($M squared), an RMSE of $1.683 million, and an MAE of $0.981 million. In comparison, the BPR + Conference model achieved a substantially lower MSE of 0.886 ($M squared), an RMSE of $0.941 million, and an MAE of $0.598 million.
+
+Including conference affiliation reduced test MSE by approximately 68.7%, RMSE by 44.1%, and MAE by 39.0% relative to the BPR-only model. These improvements indicate that conference information provides meaningful predictive value beyond projected basketball performance alone.
+
+We therefore select the BPR + Conference model as our preferred specification because it minimizes held-out squared prediction loss, consistent with the business objective established in the Plan section.
 
 # Predict
 
+After using our conference-adjusted model, we refit the model using the 353 matched teams to get the final NIL benchmarks
+
+For each team, we predict log NIL using BPR and conference. We then convert the prediction to millioons of dollars and apply a residual smearing adjustment to estimate the conditional mean NIL
+
 ## Team NIL Benchmarks
+
+```{python}
+# Refit the selected specification on all matched teams
+final_data = tm_data.sort('team')
+final_pd = final_data.to_pandas()
+
+# Encode conference; Big Ten remains the reference
+full_design = final_pd[['bpr', 'log_nil']].copy()
+
+full_dummies = pd.get_dummies(
+    final_pd['conference'],
+    prefix='conference',
+    dtype=int
+)
+
+assert 'conference_BigTen' in full_dummies.columns
+
+full_conf_cols = sorted(
+    c for c in full_dummies.columns
+    if c != 'conference_BigTen'
+)
+
+full_design = pd.concat(
+    [full_design, full_dummies[full_conf_cols]],
+    axis=1
+)
+
+# Fit the final conference-adjusted OLS model
+final_fit = smf.ols(
+    'log_nil ~ bpr + ' + ' + '.join(full_conf_cols),
+    data=full_design
+).fit()
+
+# Model predictions on the log NIL scale
+pred_log = np.asarray(final_fit.predict(full_design))
+
+# Convert to median and smearing-adjusted mean NIL
+smearing_factor = np.mean(np.exp(final_fit.resid))
+
+pred_median = np.exp(pred_log)
+pred_mean = pred_median * smearing_factor
+
+# Create the final benchmark dataset
+benchmarks = (
+    final_data
+    .with_columns(
+        pl.Series('median_benchmark_m', pred_median),
+        pl.Series('benchmark_nil_m', pred_mean)
+    )
+    .with_columns(
+        gap_m=pl.col('benchmark_nil_m') - pl.col('nil_m')
+    )
+    .with_columns(
+        bpr_rank=pl.col('bpr')
+            .rank('min', descending=True)
+            .over('conference')
+            .cast(pl.Int64),
+        gap_rank=pl.col('gap_m')
+            .rank('min', descending=True)
+            .over('conference')
+            .cast(pl.Int64),
+        conference_teams=pl.len().over('conference')
+    )
+)
+
+print('Teams benchmarked:', benchmarks.height)
+print('Final model R-squared:', round(final_fit.rsquared, 3))
+print('Smearing factor:', round(smearing_factor, 3))
+
+benchmarks.select(
+    'team', 'conference', 'bpr',
+    'nil_m', 'benchmark_nil_m', 'gap_m'
+).head()
+```
 
 ## Identifying Teams Above and Below Benchmark
 
+```{python}
+# Largest positive gaps: estimated NIL below benchmark
+top_below = (
+    benchmarks
+    .filter(pl.col('gap_m') > 0)
+    .sort('gap_m', descending=True)
+    .select(
+        'team', 'conference', 'bpr',
+        'nil_m', 'benchmark_nil_m', 'gap_m'
+    )
+    .head(8)
+)
+
+# Largest negative gaps: estimated NIL above benchmark
+top_above = (
+    benchmarks
+    .filter(pl.col('gap_m') < 0)
+    .sort('gap_m')
+    .select(
+        'team', 'conference', 'bpr',
+        'nil_m', 'benchmark_nil_m', 'gap_m'
+    )
+    .head(8)
+)
+
+print("TEAMS BELOW THEIR NIL BENCHMARK")
+print(
+    top_below.with_columns(
+        pl.col(pl.Float64).round(2)
+    )
+)
+
+print("\nTEAMS ABOVE THEIR NIL BENCHMARK")
+print(
+    top_above.with_columns(
+        pl.col(pl.Float64).round(2)
+    )
+)
+```
+
 ## Utah State Case Study
+
+Utah State University provides a practical case study for interpreting the model's NIL benchmarks. We compare Utah State's estimated NIL valuation with the predicted value associated with its projected BPR and conference membership.
+
+We also compare Utah State with other teams in its conference to assess its relative projected basketball strength and benchmark gap. These comparisons identify potential funding questions for further investigation, not a definitive recommendation to increase NIL expenditures.
+
+```{python}
+# Locate Utah State
+usu = benchmarks.filter(
+    pl.col('team') == 'Utah State'
+)
+
+assert usu.height == 1, "Check Utah State team name"
+
+# Extract case-study values
+usu_conference = usu['conference'][0]
+usu_nil = float(usu['nil_m'][0])
+usu_bpr = float(usu['bpr'][0])
+usu_median = float(usu['median_benchmark_m'][0])
+usu_benchmark = float(usu['benchmark_nil_m'][0])
+usu_gap = float(usu['gap_m'][0])
+
+print("UTAH STATE NIL CASE STUDY")
+print("Conference:", usu_conference)
+print("Projected BPR:", round(usu_bpr, 2))
+print(f"Estimated NIL: ${usu_nil:.2f}M")
+print(f"Median benchmark: ${usu_median:.2f}M")
+print(f"Mean NIL benchmark: ${usu_benchmark:.2f}M")
+print(f"Benchmark gap: ${usu_gap:+.2f}M")
+
+print(
+    "BPR rank in conference:",
+    int(usu['bpr_rank'][0]),
+    "of",
+    int(usu['conference_teams'][0])
+)
+
+print(
+    "Gap rank in conference:",
+    int(usu['gap_rank'][0]),
+    "of",
+    int(usu['conference_teams'][0])
+)
+
+# Show all of Utah State's conference peers
+usu_peers = (
+    benchmarks
+    .filter(pl.col('conference') == usu_conference)
+    .sort('gap_m', descending=True)
+    .select(
+        'team', 'bpr', 'nil_m',
+        'benchmark_nil_m', 'gap_m'
+    )
+)
+
+print("\nCONFERENCE COMPARISON")
+print(
+    usu_peers.with_columns(
+        pl.col(pl.Float64).round(2)
+    )
+)
+```
+
+```{python}
+usu_plot = pl.DataFrame({
+    'category': ['Estimated NIL', 'Model Benchmark'],
+    'nil_m': [usu_nil, usu_benchmark]
+})
+
+(ggplot(usu_plot, aes(x='category', y='nil_m', fill='category'))
+    + geom_col(width=0.6)
+    + coord_flip()
+    + labs(
+        title='Utah State NIL Benchmark Comparison',
+        x='',
+        y='Estimated NIL ($ millions)'
+    )
+    + theme_minimal()
+    + theme(legend_position='none')
+)
+```
 
 # Communicate
 
-## Key Findings
+## Business Recommendations
 
-## Recommendations
+The analysis suggests that conference-adjusted NIL benchmarks provide a more useful basis for comparing programs than projected basketball performance alone.
+
+First, athletic departments and NIL collectives should benchmark their estimated financial resources against programs with comparable projected basketball strength and conference membership. The significant improvement in test prediction accuracy indicates that conference context helps explain variation in NIL valuations beyond BPR alone.
+
+Second, programs with large positive benchmark gaps should be prioritized for further financial and roster analysis. A positive gap indicates that a team's estimated NIL valuation is below the amount predicted by the model. These differences may suggest opportunities to investigate funding, recruiting, and player retention strategies, although they do not independently establish underfunding.
+
+Third, programs with negative benchmark gaps should evaluate whether their higher estimated NIL valuations align with their strategic priorities.Higher-than-benchmark valuations may reflect recruiting investments, institutional resources, or marketability that the model does not directly measure. They should not automatically be interpreted as inefficient spending.
+
+Finally, Utah State provides a practical application of this framework. Comparing its projected BPR, NIL estimate, conference standing, and model-implied benchmark helps identify whether its estimated resources are relatively high or low for its projected basketball strength. Before recommending any change in funding, Utah State would need verified NIL commitments, roster-retention information, and a clearer understanding of the expected return on additional spending.
 
 ## Limitations and Uncertainty
 
+Although the selected regression model provides useful benchmarks, several limitations affect the conclusions.
+
+First, estimated NIL valuations are not verified team expenditures, and preseason BPR measures projected rather than realized basketball performance. Consequently, the model evaluates associations between estimates rather than the financial returns from actual NIL investments.
+
+Second, the analysis uses cross-sectional data from a single season. It cannot determine whether increasing NIL expenditures leads to stronger future performance, nor can it fully capture factors such as recruiting reputation, donor contributions, athletic revenue, and media exposure.
+
+Third, the model assumes a common BPR slope across conferences and relies on a finite sample of teams. Predictions and team rankings are subject to model uncertainty, measurement error, and possible omitted-variable bias.
+
+Future research could incorporate verified NIL payments, actual season outcomes, player-level performance, athletic department revenues, and multiple seasons of data. These additions would help distinguish market valuations from actual expenditures and support more meaningful analysis of the relationship between NIL investment and basketball performance.
+
 ## Conclusion
+
+This project developed a regression-based framework for evaluating estimated NIL valuations across Division I men's basketball programs. The analysis found a positive association between projected basketball strength and NIL valuations, while accounting for conference affiliation substantially improved predictive performance.
+
+The selected conference-adjusted model achieved a held-out RMSE of $0.941 million and was used to create team-level NIL benchmarks. These benchmarks provide a consistent method for comparing programs and identifying those whose estimated valuations differ from model expectations.
+
+Ultimately, the analysis demonstrates how regression and statistical inference can support financial benchmarking in college athletics. While the results cannot establish which programs are definitively overfunded or underfunded, they provide an evidence-based starting point for more informed NIL planning and resource-allocation discussions.
 
 # References
